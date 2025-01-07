@@ -1,0 +1,197 @@
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.classification.LogisticRegression
+import org.apache.spark.ml.clustering.KMeans
+import org.apache.spark.ml.feature.StringIndexerModel
+import org.apache.spark.ml.feature.{CountVectorizer,StopWordsRemover, StringIndexer, VectorAssembler}
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.functions._
+import org.apache.spark.graphx._
+
+object SentimentAnalysis {
+
+  def main(args: Array[String]): Unit = {
+
+    // Création d'une session Spark
+    val spark = SparkSession.builder
+      .appName("Sentiment Analysis")
+      .master("local[*]") // Exécution en local avec tous les cœurs disponibles
+      .getOrCreate()
+      
+    import spark.implicits._ // Import des fonctions implicites pour travailler avec les DataFrames
+
+    try {
+      // Lecture du fichier CSV contenant les tweets
+      val df = spark.read
+        .option("header", "true") // Le fichier a un en-tête
+        .option("inferSchema", "true") // Spark essaie de deviner le type de données de chaque colonne
+        .csv("C:/Users/iyadb/OneDrive/Documents/Tweets.csv/Tweetstest.csv")
+
+      // Définition des sentiments valides
+      val sentimentsValides = Seq("positive", "negative", "neutral")
+
+      // Comptage du nombre de tweets pour chaque sentiment
+      val sentimentCounts = df.filter(col("airline_sentiment").isin(sentimentsValides: _*)) // Filtrer les sentiments valides
+        .select("airline_sentiment")
+        .groupBy("airline_sentiment")
+        .count()
+
+      sentimentCounts.show() // Affichage du comptage des sentiments
+
+      // Fonction pour nettoyer le texte des tweets
+      def cleanTweet(tweet: String): String = {
+        Option(tweet).getOrElse("") // Gérer les tweets nuls
+          .replaceAll("http\\S+", "") // Supprimer les URLs
+          .replaceAll("@[\\w_]+", "") // Supprimer les mentions (@utilisateur)
+          .replaceAll("#[\\w_]+", "") // Supprimer les hashtags (#hashtag)
+          .replaceAll("[^a-zA-Z0-9\\s]", "") // Supprimer les caractères spéciaux
+          .trim // Supprimer les espaces en début et fin de chaîne
+          .toLowerCase // Convertir en minuscules
+      }
+
+      // Créer une User Defined Function (UDF) à partir de la fonction cleanTweet
+      val cleanTweetUDF = udf(cleanTweet _)
+      // Appliquer la UDF pour nettoyer le texte des tweets et créer une nouvelle colonne "cleaned_text"
+      val cleanedDf = df.withColumn("cleaned_text", cleanTweetUDF(col("text")))
+      // Diviser le texte nettoyé en tokens (mots) et créer une nouvelle colonne "tokens"
+      val tokenizedDf = cleanedDf.withColumn("tokens", split(col("cleaned_text"), "\\s+"))
+
+      // Supprimer les mots vides (stop words) de la colonne "tokens"
+      val remover = new StopWordsRemover()
+        .setInputCol("tokens")
+        .setOutputCol("filtered_tokens")
+      val removedDf = remover.transform(tokenizedDf)
+
+      // CountVectorizer : Convertir les tokens en vecteurs de fréquence
+      val cv = new CountVectorizer()
+        .setInputCol("filtered_tokens")
+        .setOutputCol("features")
+        .setMinDF(1) // Ignorer les mots qui apparaissent dans moins de 1 document
+        .setMaxDF(1.0) // Ignorer les mots qui apparaissent dans plus de 100% des documents
+
+      // Entraîner le CountVectorizer sur les données
+      val cvModel = cv.fit(removedDf)
+      // Transformer les données en utilisant le modèle CountVectorizer
+      val featurizedData = cvModel.transform(removedDf)
+
+      // Filtrer les lignes AVANT le StringIndexer pour éviter les erreurs dues aux valeurs non valides
+      val filteredDf = removedDf.filter(col("airline_sentiment").isin(sentimentsValides: _*))
+
+      // StringIndexer : Convertir la colonne "airline_sentiment" en valeurs numériques (labels)
+      val indexer = new StringIndexer()
+        .setInputCol("airline_sentiment")
+        .setOutputCol("label")
+        .setHandleInvalid("skip") // Ignorer les valeurs non valides
+
+      // LogisticRegression : Créer un modèle de régression logistique
+      val lr = new LogisticRegression()
+        .setMaxIter(10) // Nombre maximum d'itérations
+        .setRegParam(0.01) // Paramètre de régularisation
+
+      // Pipeline : Créer un pipeline pour enchaîner les étapes de prétraitement et d'entraînement
+      val pipeline = new Pipeline()
+        .setStages(Array(cv, indexer, lr))
+
+      // Diviser les données en ensembles d'entraînement et de test
+      val Array(trainingData, testData) = filteredDf.randomSplit(Array(0.7, 0.3), seed = 1234L)
+
+      // Entraînement du modèle
+      val model = pipeline.fit(trainingData)
+
+      // Afficher les métadonnées du StringIndexer (les labels et leur index)
+      val indexerModel = model.stages(1).asInstanceOf[StringIndexerModel]
+      println(indexerModel.labels.mkString(", "))
+
+      // Faire des prédictions sur l'ensemble de test
+      val predictions = model.transform(testData)
+
+      // Renommer la colonne "prediction" en "lrPrediction"
+      val renamedPredictions = predictions.withColumnRenamed("prediction", "lrPrediction")
+
+      // Enregistrer les prédictions dans un fichier CSV
+      renamedPredictions.select("text", "airline_sentiment", "lrPrediction")
+        .write
+        .option("header", "true")
+        .mode("overwrite")
+        .csv("C:/Users/iyadb/OneDrive/Documents/Tweets.csv/predictionsP.csv")
+
+      // VectorAssembler : Combiner les features en un seul vecteur
+      val assembler = new VectorAssembler()
+        .setInputCols(Array("features"))
+        .setOutputCol("featureVector")
+      val kmeansData = assembler.transform(renamedPredictions)
+
+      // KMeans : Créer un modèle KMeans pour le clustering
+      val kmeans = new KMeans()
+        .setK(5) // Nombre de clusters
+        .setSeed(1L) // Graine aléatoire
+        .setFeaturesCol("featureVector")
+        .setPredictionCol("kmeansPrediction")
+
+      // Entraîner le modèle KMeans
+      val kmeansModel = kmeans.fit(kmeansData)
+      // Faire des prédictions de cluster sur les données
+      val kmeansPredictions = kmeansModel.transform(kmeansData)
+
+      // --- Modifications pour le graphe ---
+
+      // 1. Créer un DataFrame avec les mots et leurs clusters
+      val clustersDf = kmeansPredictions
+        .select(explode(col("filtered_tokens")).as("word"), col("kmeansPrediction"))
+        .distinct()
+
+      // Enregistrer les clusters dans un fichier CSV
+      clustersDf.write
+        .option("header", "true")
+        .mode("overwrite")
+        .csv("C:/Users/iyadb/OneDrive/Documents/Tweets.csv/clustersP.csv")
+
+      // 2. Créer un Map pour associer les hascodes aux mots
+      val wordMap = removedDf.select(explode(col("filtered_tokens")).as("word"))
+        .distinct()
+        .map(row => (row.getAs[String]("word").hashCode.toLong, row.getAs[String]("word")))
+        .collect()
+        .toMap
+
+      // 3. Créer les arêtes du graphe en comptant les co-occurrences de mots
+      val edges = removedDf.select("filtered_tokens").rdd
+        .flatMap(row => {
+          val tokens = row.getAs[Seq[String]]("filtered_tokens")
+          tokens.combinations(2).flatMap {
+            case Seq(a, b) => Seq((a, b), (b, a)) // Créer les arêtes dans les deux sens
+          }
+        })
+        .map(pair => ((pair._1, pair._2), 1))
+        .reduceByKey(_ + _) // Compter les co-occurrences
+        .map { case ((src, dst), weight) => Edge(src.hashCode.toLong, dst.hashCode.toLong, weight) }
+
+      // Créer un graphe à partir des arêtes
+      val graph = Graph.fromEdges(edges, 0)
+
+      // 4. Exporter les nœuds (mots uniques)
+      graph.vertices
+        .map { case (id, _) => (id, wordMap(id)) } // Récupérer le mot associé à l'id
+        .distinct()
+        .toDF("id", "word") // Enregistrer l'id et le mot
+        .write
+        .option("header", "true")
+        .mode("overwrite")
+        .csv("C:/Users/iyadb/OneDrive/Documents/Tweets.csv/verticesP.csv")
+
+      // 5. Exporter les arêtes avec leurs poids
+      graph.edges
+        .map { case Edge(src, dst, weight) => (src, dst, weight) }
+        .toDF("src", "dst", "weight")
+        .write
+        .option("header", "true")
+        .mode("overwrite")
+        .csv("C:/Users/iyadb/OneDrive/Documents/Tweets.csv/edgesP.csv")
+
+    } catch {
+      case e: Exception => println(s"Erreur : ${e.getMessage}")
+    } finally {
+      spark.stop() // Arrêter la session Spark
+    }
+  }
+}
+
+SentimentAnalysis.main(Array())
